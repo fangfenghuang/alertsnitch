@@ -1,172 +1,134 @@
-# AlertSnitch
+# 安装步骤
+## 安装Mysql（版本5.7，大于5.7有报错，安装过程略），创建数据库alertsnitch，alertsnitch用户及授权
+## 创建数据库
+create database alertsnitch;
+use alertsnitch;
 
-Captures Prometheus AlertManager alerts and writes them in a MySQL or
-Postgres database for future examination.
+执行建表脚本: db.d/mysql/0.0.1-bootstrap.sql
 
-Because given a noisy enough alerting environment, offline querying
-capabilities of triggered alerts is extremely valuable.
+修改Mode verions数据: db.d/mysql/0.1.0-fingerprint.sql
 
-## How does it work
+## 安装alertsnitch，修改下面ALERTSNITCH_DSN的值
 
-1. You stand up one of these however you like (multi-arch Docker images provided)
-1. You setup AlertManager to point at it and propagate your alerts in.
-1. Every alert that gets triggered reaches your database.
-1. Profit.
-
-```mermaid
-graph TD
-    A[alertmanager] -->|POST|B(AlertSnitch)
-    B --> |Save|C(MySQL/PG Database)
-    C -.-|Graph|G[Grafana]
-    C -.-|Query|D[MySQL/PG Client]
-    style B fill:#f9f,stroke:#333,stroke-width:1px
-    style C fill:#00A0A0,stroke:#333,stroke-width:1px
-    style D fill:#00C000
-    style G fill:#00C000
-```
-
-## Local install
-
-Simply install to your $GOPATH using your GO tools
-
-```sh
-$ go get gitlab.com/yakshaving.art/alertsnitch`
-```
-
-## Requirements
-
-To run AlertSnitch requires a MySQL or Postgres database to write to.
-
-The database must be initialized with AlertSnitch model.
-
-AlertSnitch will not become online until the model is up to date with the
-expected one. Bootstrapping scripts are provided in the [scripts][./script.d]
-folder.
-
-## Configuration
-
-### MySQL
-
-For specifics about how to set up the MySQL DSN refer to [Go MySQL client driver][1]
-
-This is a sample of a DSN that would connect to the local host over a Unix socket
-
-```bash
-export ALERTSNITCH_BACKEND="mysql"
-export ALERTSNITCH_DSN="${MYSQL_USER}:${MYSQL_PASSWORD}@/${MYSQL_DATABASE}"
-```
-
-### Postgres
-
-```bash
-export ALERTSNITCH_BACKEND="postgres"
-export ALERTSNITCH_DSN="sslmode=disable user=${PGUSER} password=${PGPASSWORD} host=${PGHOST} database=${PGDATABASE}"
-```
-
-## How to run
-
-### Running with Docker
-
-**Run using docker in this very registry, for ex.**
-
-```sh
-$ docker run --rm \
-    -p 9567:9567 \
-    -e ALERTSNITCH_DSN \
-    -e ALERTSNITCH_BACKEND \
-    registry.gitlab.com/yakshaving.art/alertsnitch
-```
-
-### Running Manually
-
-1. Open a terminal and run the following
-1. Copy the AlertSnitch binary from your $GOPATH to `/usr/local/bin` with `sudo cp ~/go/bin/alertsnitch /usr/local/bin`
-1. Now run AlertSnitch as with just `alertsnitch`
-   - To just see the alerts that are being received, use the *null* backend with `ALERTSNITCH_BACKEND=null`
-
-### Setting up in AlertManager
-
-Once AlertSnitch is up and running, configure the Prometheus Alert Manager to
-forward every alert to it on the `/webhooks` path.
+ALERTSNITCH_DSN="${MYSQL_USER}:${MYSQL_PASSWORD}(${MYSQL_IP}:${MYSQL_PORT})/{$MYSQL_DATABASE}"
 
 ```yaml
+# alertsnitch-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertsnitch
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: alertsnitch    
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: alertsnitch
+    spec:
+      containers:
+      - image: registry.gitlab.com/yakshaving.art/alertsnitch
+        name: alertsnitch
+        ports:
+        - containerPort: 9567
+          name: http
+        env:
+        - name: ALERTSNITCH_BACKEND
+          value: mysql
+        - name: ALERTSNITCH_DSN
+          value: myuser:123456@tcp(10.19.0.1:3306)/alertsnitch
+        readinessProbe:
+          httpGet:
+            path: /-/ready
+            port: 9567
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /-/health
+            port: 9567
+          initialDelaySeconds: 60
+          periodSeconds: 10
 ---
-receivers:
-- name: alertsnitch
-  webhook_configs:
-    - url: http://<alertsnitch-host-or-ip>:9567/webhook
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertsnitch
+  namespace: default
+spec:
+  ports:
+  - name: http
+    port: 9567
+    targetPort: http
+  selector:
+    app.kubernetes.io/name: alertsnitch
 ```
 
-Then add the route
-
+## 配置alertmanager
 ```yaml
-# We want to send all alerts to alertsnitch and then continue to the
-# appropiate handler.
-route:
-  routes:
-  - receiver: alertsnitch
-    continue: true
+    route:
+      receiver: all-to-alertsnitch
+      routes:
+      #所有告警收集
+      - receiver: all-to-alertsnitch
+        continue: true
+ 
+    receivers:
+    #alertsnitch
+    - name: 'all-to-alertsnitch'
+      webhook_configs:
+      - url: 'http://alertsnitch.default:9567/webhook'
+        send_resolved: true
 ```
 
-### Command line arguments
+# 仪表盘
+https://grafana.com/grafana/dashboards/15833
 
-* **-database-backend** sets the database backend to connect to, supported are `mysql`, `postgres` and `null`
-* **-debug** dumps the received WebHook payloads to the log so you can understand what is going on
-* **-listen.address** _string_ address in which to listen for HTTP requests (default ":9567")
-* **-version** prints the version and exit
+http://alertsnitch.default:9567/-/ready
 
-### Environment variables
 
-- **ALERTSNITCH_DSN** *required* database connection query string
-- **ALERTSNITCH_ADDR** same as **-listen.address**
-- **ALERTSNITCH_BACKEND**  same as **-database-backend**
 
-### Readiness probe
+# 本地调试
+go run main.go -dsn "myuser:123456@tcp(10.19.0.1:3306)/alertsnitch" -database-backend null
 
-AlertSnitch offers a `/-/ready` endpoint which will return 200 if the
-application is ready to accept WebHook posts.
+## webhook
+http://<alertsnitch-host-or-ip>:9567/webhook
 
-During startup AlertSnitch will probe the MySQL database and the database
-model version. If everything is as expected it will set itself as ready.
 
-In case of failure it will return a 500 and will write the error in the
-response payload.
+# 告警历史
+## 数据库表
+一条告警消息生成一个alertGroupID及AlertID
 
-### Liveliness probe
+- alert
+一条告警消息记录一条alert
 
-AlertSnitch offers a `/-/health` endpoint which will return 200 as long as
-the MySQL/Postgres database is reachable.
+- alertannotation
+一条告警消息记录一条alertannotation
 
-In case of error it will return a 500 and will write the error in the
-response payload.
+- alertgroup
+一条告警消息记录一条alertgroup
 
-### Metrics
+- alertlabel
+一条告警消息记录多条label
 
-AlertSnitch provides Prometheus metrics on `/metrics` as per Prometheus
-convention.
+- commonanotation
+一条告警消息记录一条commonanotation
 
-### Security
+- commonlabel
+一条告警消息记录多条commonlabel
 
-There is no offering of security of any kind. AlertSnitch is not ment to be
-exposed to the internet but to be executed in an internal network reachable
-by the alert manager.
+- grouplabel
+一条告警消息记录多条grouplabel
 
-### Grafana Compatibility
+- model
+alertsnitch版本
 
-AlertSnitch writes alerts in such a way that they can be explored using
-Grafana's MySQL/Postgres Data Source plugin. Refer to Grafana documentation
-for further instructions.
-
-## Testing locally
-
-We provide a couple of Makefile tasks to make it easy to run integration tests
-locally, to get a full coverage sample run:
-
-```sh
-make bootstrap_local_testing
-make integration
-go tool cover -html=coverage.out
-make teardown_local_testing
-```
-
-[1]: https://github.com/go-sql-driver/mysql
+## 记录说明
+- 未恢复和已恢复告警列表显示相同一组label的alert，如果已恢复则显示结束时间，否则只显示开始时间和持续时间
+- 告警历史展示每一次告警消息都会有一个起始时间和结束时间
+- 每一次告警消息
+- 开始时间是从第一次接收到消息开始
+- 如果接收中断，告警会认为是not resolved,但是有记录结束时间
